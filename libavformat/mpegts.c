@@ -56,6 +56,9 @@
         (prev_dividend) = (dividend);                                          \
     } while (0)
 
+#define PROBE_PACKET_MAX_BUF 8192
+#define PROBE_PACKET_MARGIN 5
+
 enum MpegTSFilterType {
     MPEGTS_PES,
     MPEGTS_SECTION,
@@ -165,6 +168,8 @@ struct MpegTSContext {
     /** filters for various streams specified by PMT + for the PAT and PMT */
     MpegTSFilter *pids[NB_PID_MAX];
     int current_pid;
+
+    AVStream *epg_stream;
 };
 
 #define MPEGTS_OPTIONS \
@@ -594,28 +599,42 @@ static int analyze(const uint8_t *buf, int size, int packet_size,
     return best_score - FFMAX(stat_all - 10*best_score, 0)/10;
 }
 
-/* autodetect fec presence. Must have at least 1024 bytes  */
-static int get_packet_size(const uint8_t *buf, int size)
+/* autodetect fec presence */
+static int get_packet_size(AVFormatContext* s)
 {
     int score, fec_score, dvhs_score;
+    int margin;
+    int ret;
 
-    if (size < (TS_FEC_PACKET_SIZE * 5 + 1))
-        return AVERROR_INVALIDDATA;
+    /*init buffer to store stream for probing */
+    uint8_t buf[PROBE_PACKET_MAX_BUF] = {0};
+    int buf_size = 0;
 
-    score      = analyze(buf, size, TS_PACKET_SIZE,      0);
-    dvhs_score = analyze(buf, size, TS_DVHS_PACKET_SIZE, 0);
-    fec_score  = analyze(buf, size, TS_FEC_PACKET_SIZE,  0);
-    av_log(NULL, AV_LOG_TRACE, "score: %d, dvhs_score: %d, fec_score: %d \n",
-            score, dvhs_score, fec_score);
+    while (buf_size < PROBE_PACKET_MAX_BUF) {
+        ret = avio_read_partial(s->pb, buf + buf_size, PROBE_PACKET_MAX_BUF - buf_size);
+        if (ret < 0)
+            return AVERROR_INVALIDDATA;
+        buf_size += ret;
 
-    if (score > fec_score && score > dvhs_score)
-        return TS_PACKET_SIZE;
-    else if (dvhs_score > score && dvhs_score > fec_score)
-        return TS_DVHS_PACKET_SIZE;
-    else if (score < fec_score && dvhs_score < fec_score)
-        return TS_FEC_PACKET_SIZE;
-    else
-        return AVERROR_INVALIDDATA;
+        score      = analyze(buf, buf_size, TS_PACKET_SIZE,      0);
+        dvhs_score = analyze(buf, buf_size, TS_DVHS_PACKET_SIZE, 0);
+        fec_score  = analyze(buf, buf_size, TS_FEC_PACKET_SIZE,  0);
+        av_log(s, AV_LOG_TRACE, "Probe: %d, score: %d, dvhs_score: %d, fec_score: %d \n",
+            buf_size, score, dvhs_score, fec_score);
+
+        margin = mid_pred(score, fec_score, dvhs_score);
+
+        if (buf_size < PROBE_PACKET_MAX_BUF)
+            margin += PROBE_PACKET_MARGIN; /*if buffer not filled */
+
+        if (score > margin)
+            return TS_PACKET_SIZE;
+        else if (dvhs_score > margin)
+            return TS_DVHS_PACKET_SIZE;
+        else if (fec_score > margin)
+            return TS_FEC_PACKET_SIZE;
+    }
+    return AVERROR_INVALIDDATA;
 }
 
 typedef struct SectionHeader {
@@ -786,6 +805,7 @@ static const StreamType ISO_types[] = {
     { 0x24, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_HEVC       },
     { 0x42, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_CAVS       },
     { 0xd1, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_DIRAC      },
+    { 0xd2, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_AVS2       },
     { 0xea, AVMEDIA_TYPE_VIDEO, AV_CODEC_ID_VC1        },
     { 0 },
 };
@@ -1286,15 +1306,17 @@ skip:
                                             st = pst;
                                     }
                                 }
-                                if (f->last_pcr != -1 && st && st->discard != AVDISCARD_ALL) {
+                                if (f->last_pcr != -1 && !f->discard) {
                                     // teletext packets do not always have correct timestamps,
                                     // the standard says they should be handled after 40.6 ms at most,
                                     // and the pcr error to this packet should be no more than 100 ms.
                                     // TODO: we should interpolate the PCR, not just use the last one
                                     int64_t pcr = f->last_pcr / 300;
                                     pcr_found = 1;
-                                    pes->st->pts_wrap_reference = st->pts_wrap_reference;
-                                    pes->st->pts_wrap_behavior = st->pts_wrap_behavior;
+                                    if (st) {
+                                        pes->st->pts_wrap_reference = st->pts_wrap_reference;
+                                        pes->st->pts_wrap_behavior = st->pts_wrap_behavior;
+                                    }
                                     if (pes->dts == AV_NOPTS_VALUE || pes->dts < pcr) {
                                         pes->pts = pes->dts = pcr;
                                     } else if (pes->st->codecpar->codec_id == AV_CODEC_ID_DVB_TELETEXT &&
@@ -1706,6 +1728,13 @@ static void scte_data_cb(MpegTSFilter *filter, const uint8_t *section,
     if (idx < 0)
         return;
 
+    /**
+     * In case we receive an SCTE-35 packet before mpegts context is fully
+     * initialized.
+     */
+    if (!ts->pkt)
+        return;
+
     new_data_packet(section, section_len, ts->pkt);
     ts->pkt->stream_index = idx;
     prg = av_find_program_from_stream(ts->stream, NULL, idx);
@@ -2113,7 +2142,7 @@ int ff_parse_mpeg2_descriptor(AVFormatContext *fc, AVStream *st, int stream_type
     return 0;
 }
 
-static AVStream *find_matching_stream(MpegTSContext *ts, int pid,
+static AVStream *find_matching_stream(MpegTSContext *ts, int pid, unsigned int programid,
                                       int stream_identifier, int pmt_stream_idx)
 {
     AVFormatContext *s = ts->stream;
@@ -2122,6 +2151,8 @@ static AVStream *find_matching_stream(MpegTSContext *ts, int pid,
 
     for (i = 0; i < s->nb_streams; i++) {
         AVStream *st = s->streams[i];
+        if (st->program_num != programid)
+            continue;
         if (stream_identifier != -1) { /* match based on "stream identifier descriptor" if present */
             if (st->stream_identifier == stream_identifier+1) {
                 found = st;
@@ -2292,7 +2323,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
         if (ts->pids[pid] && ts->pids[pid]->type == MPEGTS_PES) {
             pes = ts->pids[pid]->u.pes_filter.opaque;
             if (ts->merge_pmt_versions && !pes->st) {
-                st = find_matching_stream(ts, pid, stream_identifier, i);
+                st = find_matching_stream(ts, pid, h->id, stream_identifier, i);
                 if (st) {
                     pes->st = st;
                     pes->stream_type = stream_type;
@@ -2314,7 +2345,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 mpegts_close_filter(ts, ts->pids[pid]); // wrongly added sdt filter probably
             pes = add_pes_stream(ts, pid, pcr_pid);
             if (ts->merge_pmt_versions && pes && !pes->st) {
-                st = find_matching_stream(ts, pid, stream_identifier, i);
+                st = find_matching_stream(ts, pid, h->id, stream_identifier, i);
                 if (st) {
                     pes->st = st;
                     pes->stream_type = stream_type;
@@ -2336,7 +2367,7 @@ static void pmt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 st = ts->stream->streams[idx];
             }
             if (ts->merge_pmt_versions && !st) {
-                st = find_matching_stream(ts, pid, stream_identifier, i);
+                st = find_matching_stream(ts, pid, h->id, stream_identifier, i);
             }
             if (!st) {
                 st = avformat_new_stream(ts->stream, NULL);
@@ -2468,6 +2499,60 @@ static void pat_cb(MpegTSFilter *filter, const uint8_t *section, int section_len
                 clear_avprogram(ts, ts->stream->programs[j]->id);
         }
     }
+}
+
+static void eit_cb(MpegTSFilter *filter, const uint8_t *section, int section_len)
+{
+    MpegTSContext *ts = filter->u.section_filter.opaque;
+    const uint8_t *p, *p_end;
+    SectionHeader h1, *h = &h1;
+
+    /*
+     * Sometimes we receive EPG packets but SDT table do not have
+     * eit_pres_following or eit_sched turned on, so we open EPG
+     * stream directly here.
+     */
+    if (!ts->epg_stream) {
+        ts->epg_stream = avformat_new_stream(ts->stream, NULL);
+        if (!ts->epg_stream)
+            return;
+        ts->epg_stream->id = EIT_PID;
+        ts->epg_stream->codecpar->codec_type = AVMEDIA_TYPE_DATA;
+        ts->epg_stream->codecpar->codec_id = AV_CODEC_ID_EPG;
+    }
+
+    if (ts->epg_stream->discard == AVDISCARD_ALL)
+        return;
+
+    p_end = section + section_len - 4;
+    p     = section;
+
+    if (parse_section_header(h, &p, p_end) < 0)
+        return;
+    if (h->tid < EIT_TID || h->tid > OEITS_END_TID)
+        return;
+
+    av_log(ts->stream, AV_LOG_TRACE, "EIT: tid received = %.02x\n", h->tid);
+
+    /**
+     * Service_id 0xFFFF is reserved, it indicates that the current EIT table
+     * is scrambled.
+     */
+    if (h->id == 0xFFFF) {
+        av_log(ts->stream, AV_LOG_TRACE, "Scrambled EIT table received.\n");
+        return;
+    }
+
+    /**
+     * In case we receive an EPG packet before mpegts context is fully
+     * initialized.
+     */
+    if (!ts->pkt)
+        return;
+
+    new_data_packet(section, section_len, ts->pkt);
+    ts->pkt->stream_index = ts->epg_stream->index;
+    ts->stop_parse = 1;
 }
 
 static void sdt_cb(MpegTSFilter *filter, const uint8_t *section, int section_len)
@@ -2851,7 +2936,7 @@ static int handle_packets(MpegTSContext *ts, int64_t nb_packets)
     return ret;
 }
 
-static int mpegts_probe(AVProbeData *p)
+static int mpegts_probe(const AVProbeData *p)
 {
     const int size = p->buf_size;
     int maxscore = 0;
@@ -2933,8 +3018,6 @@ static int mpegts_read_header(AVFormatContext *s)
 {
     MpegTSContext *ts = s->priv_data;
     AVIOContext *pb   = s->pb;
-    uint8_t buf[8 * 1024] = {0};
-    int len;
     int64_t pos, probesize = s->probesize;
 
     s->internal->prefer_codec_framerate = 1;
@@ -2942,10 +3025,8 @@ static int mpegts_read_header(AVFormatContext *s)
     if (ffio_ensure_seekback(pb, probesize) < 0)
         av_log(s, AV_LOG_WARNING, "Failed to allocate buffers for seekback\n");
 
-    /* read the first 8192 bytes to get packet size */
     pos = avio_tell(pb);
-    len = avio_read(pb, buf, sizeof(buf));
-    ts->raw_packet_size = get_packet_size(buf, len);
+    ts->raw_packet_size = get_packet_size(s);
     if (ts->raw_packet_size <= 0) {
         av_log(s, AV_LOG_WARNING, "Could not detect TS packet size, defaulting to non-FEC/DVHS\n");
         ts->raw_packet_size = TS_PACKET_SIZE;
@@ -2960,8 +3041,8 @@ static int mpegts_read_header(AVFormatContext *s)
         seek_back(s, pb, pos);
 
         mpegts_open_section_filter(ts, SDT_PID, sdt_cb, ts, 1);
-
         mpegts_open_section_filter(ts, PAT_PID, pat_cb, ts, 1);
+        mpegts_open_section_filter(ts, EIT_PID, eit_cb, ts, 1);
 
         handle_packets(ts, probesize / ts->raw_packet_size);
         /* if could not find service, enable auto_guess */
@@ -3216,8 +3297,10 @@ MpegTSContext *avpriv_mpegts_parse_open(AVFormatContext *s)
     ts->raw_packet_size = TS_PACKET_SIZE;
     ts->stream = s;
     ts->auto_guess = 1;
+
     mpegts_open_section_filter(ts, SDT_PID, sdt_cb, ts, 1);
     mpegts_open_section_filter(ts, PAT_PID, pat_cb, ts, 1);
+    mpegts_open_section_filter(ts, EIT_PID, eit_cb, ts, 1);
 
     return ts;
 }
